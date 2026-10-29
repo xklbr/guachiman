@@ -180,15 +180,22 @@ var installedVersion: String {
 }
 
 /// Consulta anónima a la API pública de GitHub; nil ante cualquier fallo. El callback corre en otra cola.
+/// Usa un subproceso curl y no URLSession: URLSession deja ~2–4 MB residentes en la app tras la primera
+/// consulta, y el subproceso los libera al terminar (RSS sostenido ~41,4 MB frente a ~44–46 MB).
 func fetchLatestVersion(completion: @escaping (String?) -> Void) {
-    guard let url = URL(string: Config.tagsURL) else { return completion(nil) }
-    var req = URLRequest(url: url, timeoutInterval: 10)
-    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-    req.setValue("Guachiman/\(installedVersion)", forHTTPHeaderField: "User-Agent")
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
-        guard let data, (resp as? HTTPURLResponse)?.statusCode == 200 else { return completion(nil) }
-        completion(latestVersion(fromTagsJSON: data))
-    }.resume()
+    DispatchQueue.global(qos: .utility).async {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        p.arguments = ["-fsS", "-m", "10", "-H", "Accept: application/vnd.github+json",
+                       "-A", "Guachiman/\(installedVersion)", Config.tagsURL]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return completion(nil) }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        completion(p.terminationStatus == 0 ? latestVersion(fromTagsJSON: data) : nil)
+    }
 }
 
 func launchAgentPlist(executable: String) -> [String: Any] {
