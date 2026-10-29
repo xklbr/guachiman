@@ -11,7 +11,7 @@ App nativa de la barra de menú de macOS (Swift + AppKit, macOS 13+) que vigila 
 - Cada sesión se rotula con su título de Claude Code (el de la pestaña de la terminal; `/rename` manda sobre el automático), leído de forma perezosa solo al abrir el menú, al avisar o en `--once`; sin título muestra la carpeta.
 - Muestra en el menú barras de RAM en uso y CPU con color de calor (verde → amarillo → rojo) y las sesiones ordenadas por consumo. Cada fila (sesiones, huérfanos y las 5 apps) lleva un círculo de color y un botón para detenerla (ver "Colores y detener").
 - Vigila todas las demás apps: agrupa los procesos por app (el `.app` más externo de la ruta del ejecutable, p. ej. los helpers de Google Chrome cuentan como "Google Chrome"; un proceso fuera de un `.app` es su propio grupo) y suma su RAM y su CPU (% de un núcleo, calculado entre dos sondeos). Los procesos de sesiones de Claude y de huérfanos no se repiten ahí. El menú lista las 5 apps que más RAM usan.
-- Te notifica cuando una sesión, una app o el sistema superan los umbrales. Las apps solo se cierran si tú lo pides con el botón de detener.
+- Te notifica cuando una sesión, una app (solo por CPU) o el sistema superan los umbrales; la RAM de las apps solo aparece en el aviso de memoria libre baja. Las apps solo se cierran si tú lo pides con el botón de detener.
 - Lee los procesos con `libproc` y `sysctl`; no lanza `ps`.
 
 ## Notificaciones
@@ -29,7 +29,7 @@ Un candidato a huérfano es un proceso con `ppid == 1` cuyo nombre (del ejecutab
 Cada fila del menú (sesiones de Claude, huérfanos y las 5 apps que más consumen) empieza con un círculo de color. La CPU de sesiones y huérfanos es la suma de su árbol de procesos, como en las apps. Los valores son instantáneos, salvo el gris:
 
 - **Gris**: inactivo; CPU por debajo de 1 % de forma continua durante los últimos 120 s. Una fila vista hace menos de 120 s no es gris. El gris manda sobre los demás colores, también si usa mucha RAM.
-- **Rojo**: supera un umbral (RAM sobre el 15% de la RAM física, o CPU sobre 80% de un núcleo; en huérfanos, RAM sobre 500 MB).
+- **Rojo**: supera un umbral (RAM sobre el 15% de la RAM física, o CPU sobre 80% de un núcleo; en huérfanos, RAM sobre 500 MB). El color de las filas es independiente de las notificaciones: una app con mucha RAM se ve roja, pero no genera aviso propio.
 - **Amarillo**: al menos el 75 % de alguno de esos umbrales.
 - **Verde**: el resto.
 
@@ -112,9 +112,9 @@ Imprime una tabla con pid, etiqueta, MB totales, estado (verde, amarillo o rojo;
 Se calculan a partir de la RAM física (`hw.memsize`). Las constantes están al inicio de `guachiman.swift`.
 
 - Sesión: más del 15% de la RAM física, sostenido por al menos 60 s.
-- App: más del 15% de la RAM física sostenido por 60 s, o más de 80% de un núcleo de CPU sostenido por 120 s.
+- App: solo CPU, más de 80% de un núcleo sostenido por 120 s; se avisa una vez por episodio (otro aviso solo si la CPU baja del umbral y vuelve a subir). La RAM de las apps no avisa por separado: sale en el aviso de memoria libre baja.
 - Sistema: memoria libre menor a 20% (`kern.memorystatus_level`).
-- Enfriamiento de 10 min por alerta; avisa antes solo si el valor creció más de 25% desde el último aviso.
+- Enfriamiento de 10 min por alerta (sesiones, huérfanos y sistema); avisa antes solo si el valor creció más de 25% desde el último aviso.
 - Sondeo cada 20 s.
 
 El ícono se atenúa sin sesiones y se pone rojo mientras haya una alerta activa.
