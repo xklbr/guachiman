@@ -1454,7 +1454,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let memory = physicalMemory()
     private var overSince: [pid_t: Date] = [:]
     private var orphanTracker = SustainedTracker<pid_t>()
-    private var appRamTracker = SustainedTracker<String>()
     private var appCpuTracker = SustainedTracker<String>()
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
@@ -1654,31 +1653,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Apps: RAM > 15% sostenida 60 s, CPU > 80% de un núcleo sostenida 120 s. Solo avisa, nunca cierra.
+        // Apps: CPU > 80% de un núcleo sostenida 120 s, un aviso por episodio. Solo avisa, nunca cierra; la RAM solo sale en el aviso de memoria baja.
         // Relay bajo demanda: se apaga tras 5 min continuos sin sesión ni huérfano en alerta (el amarillo no lo mantiene).
         relayQuietSince = anyOver || orphanOver ? nil : (relayQuietSince ?? now)
         if relayShouldStop(running: relayRunning, quietSince: relayQuietSince, now: now) { stopRelay(wait: false) }
         var appOver = false
         let appKeys = Set(snap.apps.map { $0.key })
-        appRamTracker.retain(appKeys)
         appCpuTracker.retain(appKeys)
         for a in snap.apps {
-            if appRamTracker.update(a.key, over: a.bytes > limit, now: now) >= Config.sessionSustained {
-                appOver = true
-                alert(key: "appram:\(a.key)", value: Double(a.bytes),
-                      text: "\(a.name) usa \(formatBytes(a.bytes)) de RAM", now: now)
-            }
+            // Una vez por episodio: la clave queda hasta que la CPU baje del umbral.
+            let cpuKey = "appcpu:\(a.key)"
             if appCpuTracker.update(a.key, over: a.cpu > Config.appCpuPercent, now: now) >= Config.appCpuSustained {
                 appOver = true
-                alert(key: "appcpu:\(a.key)", value: a.cpu,
-                      text: "\(a.name) usa \(Int(a.cpu.rounded())) % de CPU sostenido", now: now)
+                if lastAlert[cpuKey] == nil {
+                    alert(key: cpuKey, value: a.cpu,
+                          text: "\(a.name) usa \(Int(a.cpu.rounded())) % de CPU sostenido", now: now)
+                }
+            } else {
+                lastAlert[cpuKey] = nil
             }
         }
         pruneTitleCache(live: livePids)
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
-            if k.hasPrefix("appram:") || k.hasPrefix("appcpu:") { return appKeys.contains(String(k.dropFirst(7))) }
+            if k.hasPrefix("appcpu:") { return appKeys.contains(String(k.dropFirst(7))) }
             return true
         }
 
