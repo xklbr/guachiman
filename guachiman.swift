@@ -2460,10 +2460,11 @@ if CommandLine.arguments.contains("--selftest") {
     exit(0)
 }
 
-// Instancia única: si ya corre otra app con el mismo bundle id, pedirle que abra su panel y salir.
-if let id = Bundle.main.bundleIdentifier,
-   NSRunningApplication.runningApplications(withBundleIdentifier: id)
-       .contains(where: { $0.processIdentifier != getpid() }) {
+// Instancia única con flock: es atómico, así que dos arranques simultáneos (dos LaunchAgents al iniciar
+// sesión) no pasan los dos. El fd queda abierto toda la vida del proceso y el kernel suelta el lock al morir.
+try? FileManager.default.createDirectory(atPath: Config.supportDir, withIntermediateDirectories: true)
+let instanceLock = open(Config.supportDir + "/instance.lock", O_CREAT | O_RDWR, 0o644)
+if instanceLock >= 0, flock(instanceLock, LOCK_EX | LOCK_NB) != 0 {
     DistributedNotificationCenter.default().postNotificationName(
         Notification.Name(showPanelNotification), object: nil, userInfo: nil, deliverImmediately: true)
     exit(0)
