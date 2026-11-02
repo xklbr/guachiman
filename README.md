@@ -63,7 +63,7 @@ Cada fila de sesión de Claude muestra "ctx 192k" junto al título: los tokens d
 En la cabecera del panel, junto al engranaje, hay un botón **IA**. Está **apagado por defecto** (gris tenue) y se recuerda entre ejecuciones (`aiEnabled`). Solo funciona con Claude Code: si no está instalado, el botón queda deshabilitado ("Claude Code no está instalado").
 
 - **Apagado**: Guachiman se comporta como sin IA. No escribe `alerts.jsonl` y no hay sesión de relay.
-- **Encendido** (blanco): significa "permitido arrancar el relay". Cuando salta una alerta de sesión o de huérfano (y no estás en pausa), Guachiman arranca el relay si no estaba corriendo y añade una línea JSON a `~/Library/Application Support/Guachiman/alerts.jsonl`. El relay es una sesión de Claude Code en segundo plano (Haiku) que lee el archivo y avisa a la sesión dueña del proceso. Las alertas de apps y de memoria del sistema no lo arrancan ni escriben línea.
+- **Encendido** (blanco): significa "permitido arrancar el relay". Cuando salta una alerta de sesión o de huérfano (y no estás en pausa), Guachiman arranca el relay si no estaba corriendo y añade una línea JSON a `~/Library/Application Support/Guachiman/alerts.jsonl`. El relay es una sesión de Claude Code en segundo plano (Haiku) que lee el archivo y avisa a la sesión dueña del proceso. Las alertas de apps y de memoria del sistema no lo arrancan ni escriben línea. Una sesión también dispara el aviso (y la línea, con `"reason":"cpu"` y `"cpu"`) si supera el 80 % de un núcleo sostenido 120 s; el aviso pide priorizar y partir tests y builds en lotes, con pocos workers y en secuencia.
 - Al encender (o al abrir la app con la IA encendida) Guachiman comprueba `claude auth status --json`, pero no arranca nada. Si Claude Code no tiene sesión iniciada, el relay no arrancará, el botón se pone amarillo y el panel muestra: "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`" (también llega una notificación). La comprobación se repite solo al abrir el panel; cuando pasa, el botón vuelve a blanco.
 - El aviso del relay incluye pautas para partir tests y builds pesados (lotes, límite de workers y de heap) en vez de solo detenerlos.
 - El relay se detiene solo tras 5 minutos seguidos sin sesión ni huérfano en alerta roja, al apagar el botón y al elegir "Salir" (o al recibir SIGTERM). Cada vez que se detiene (y al abrir la app) se vacía `alerts.jsonl`. Sin Guachiman no tiene sentido, así que ya no hay un LaunchAgent aparte.
@@ -113,6 +113,7 @@ Imprime una tabla con pid, etiqueta, MB totales, estado (verde, amarillo o rojo;
 Se calculan a partir de la RAM física (`hw.memsize`). Las constantes están al inicio de `guachiman.swift`.
 
 - Sesión: más del 15% de la RAM física, sostenido por al menos 60 s.
+- Sesión por CPU: más de 80% de un núcleo (suma de su árbol) sostenido por 120 s, con cooldown de 10 min por sesión; mantiene vivo el relay mientras siga en alerta.
 - App: solo CPU, más de 80% de un núcleo sostenido por 120 s; se avisa una vez por episodio (otro aviso solo si la CPU baja del umbral y vuelve a subir). La RAM de las apps no avisa por separado: sale en el aviso de memoria libre baja.
 - Sistema: memoria libre menor a 20% (`kern.memorystatus_level`).
 - Enfriamiento de 10 min por alerta (sesiones, huérfanos y sistema); avisa antes solo si el valor creció más de 25% desde el último aviso.

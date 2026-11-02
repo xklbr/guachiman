@@ -20,6 +20,8 @@ enum Config {
     static let pollActive: TimeInterval = 20     // intervalo de sondeo
     static let appCpuPercent = 80.0              // alerta de app: > 80% de un núcleo
     static let appCpuSustained: TimeInterval = 120   // ... sostenido 120 s
+    static let sessionCpuPercent = 80.0          // alerta de sesión por CPU: > 80% de un núcleo
+    static let sessionCpuSustained: TimeInterval = 120   // ... sostenido 120 s
     static let sessionExecutable = "claude"
     static let orphanBytes: UInt64 = 500 * 1_048_576  // huérfano: > 500 MB
     static let orphanAlertAfter: TimeInterval = 60    // ... sostenido 60 s para avisar
@@ -259,9 +261,11 @@ func sanitizeText(_ s: String) -> String {
 }
 
 /// Línea de `alerts.jsonl` para una sesión que superó el umbral.
-func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?) -> String {
+func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?,
+                      cpu: Int? = nil, reason: String = "ram") -> String {
     var d: [String: Any] = ["kind": "session", "ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB,
-                            "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull()]
+                            "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull(), "reason": reason]
+    if let cpu { d["cpu"] = cpu }
     d["top"] = top.map { ["pid": Int($0.pid), "mb": $0.bytes / 1_048_576, "cmd": sanitizeName($0.cmd)] as [String: Any] } ?? NSNull()
     return jsonLine(d)
 }
@@ -816,6 +820,11 @@ func runSelfTest() {
     precondition(tj?["pid"] as? Int == 9 && tj?["mb"] as? Int == 3 && tj?["cmd"] as? String == "vitest")
     let l2 = (try? JSONSerialization.jsonObject(with: Data(sessionAlertLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "", title: nil, top: nil).utf8))) as? [String: Any]
     precondition(l2?["top"] is NSNull && l2?["title"] is NSNull)
+    precondition(obj?["reason"] as? String == "ram" && obj?["cpu"] == nil)
+    let cl = sessionAlertLine(ts: 8, pid: 3, mb: 100, limitMB: 1024, cwd: "/x", title: nil, top: nil, cpu: 150, reason: "cpu")
+    let co = (try? JSONSerialization.jsonObject(with: Data(cl.utf8))) as? [String: Any]
+    precondition(co?["reason"] as? String == "cpu" && co?["cpu"] as? Int == 150 && co?["kind"] as? String == "session"
+                 && co?["pid"] as? Int == 3 && co?["ts"] as? Int == 8)
     let ol = orphanAlertLine(ts: 3, pid: 4, name: "node", mb: 600, limitMB: 500, cwd: "/x")
     let oo = (try? JSONSerialization.jsonObject(with: Data(ol.utf8))) as? [String: Any]
     precondition(oo?["kind"] as? String == "orphan" && oo?["name"] as? String == "node" && oo?["mb"] as? Int == 600
@@ -1473,6 +1482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overSince: [pid_t: Date] = [:]
     private var orphanTracker = SustainedTracker<pid_t>()
     private var appCpuTracker = SustainedTracker<String>()
+    private var sessionCpuTracker = SustainedTracker<pid_t>()
     private var polling = false
     private var refreshing = false
     private var closedAttempted = Set<pid_t>()
@@ -1675,6 +1685,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Sesiones por CPU: > 80 % de un núcleo sostenido 120 s.
+        sessionCpuTracker.retain(livePids)
+        for s in snap.sessions {
+            guard sessionCpuTracker.update(s.pid, over: s.cpu > Config.sessionCpuPercent, now: now) >= Config.sessionCpuSustained
+            else { continue }
+            anyOver = true
+            let pct = Int(s.cpu.rounded())
+            if alert(key: "sessioncpu:\(s.pid)", value: s.cpu,
+                     text: "Sesión \(sessionLabel(s)) usa \(pct) % de CPU sostenido (pid \(s.pid))", now: now), aiEnabled {
+                startRelayIfNeeded()
+                appendAlert(sessionAlertLine(
+                    ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
+                    limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: s.top,
+                    cpu: pct, reason: "cpu"))
+            }
+        }
+
         // Huérfanos: aviso a los 60 s, cierre opcional a los 10 min.
         var orphanOver = false
         let orphanPids = Set(snap.orphans.map { $0.pid })
@@ -1723,6 +1750,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pruneTitleCache(live: livePids)
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
+            if k.hasPrefix("sessioncpu:") { return livePids.contains(pid_t(k.dropFirst(11)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
             if k.hasPrefix("appcpu:") { return appKeys.contains(String(k.dropFirst(7))) }
             return true
