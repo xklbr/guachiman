@@ -1103,8 +1103,11 @@ func currentDirectory(_ pid: pid_t) -> String? {
 }
 
 private let sessionLimitBytes = UInt64(Double(physicalMemory()) * Config.sessionFraction)
+private let snapshotLock = NSLock()   // cpuPrev/cpuPrevAt: el sondeo corre fuera de main y otros cierres llaman desde main
 
 func takeSnapshot() -> Snapshot {
+    snapshotLock.lock()
+    defer { snapshotLock.unlock() }
     var parents: [pid_t: pid_t] = [:]
     var children: [pid_t: [pid_t]] = [:]
     var claudePids = Set<pid_t>()
@@ -1463,6 +1466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overSince: [pid_t: Date] = [:]
     private var orphanTracker = SustainedTracker<pid_t>()
     private var appCpuTracker = SustainedTracker<String>()
+    private var polling = false
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
     private var lastSnap: Snapshot?
@@ -1605,10 +1609,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notifier.refresh { [weak self] in self?.runPoll() }
     }
 
+    /// La lectura de procesos va en una cola utilitaria; todo lo demás (trackers, alertas, UI) vuelve a main.
     private func runPoll() {
-        let snap = takeSnapshot()
+        guard !polling else { return }
+        polling = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let snap = takeSnapshot()
+            let ticks = cpuTicks()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.polling = false
+                self.applyPoll(snap, ticks: ticks)
+            }
+        }
+    }
+
+    private func applyPoll(_ snap: Snapshot, ticks: (busy: UInt64, total: UInt64)?) {
         let now = Date()
-        if let cur = cpuTicks() {
+        if let cur = ticks {
             if let prev = cpuTicksPrev { cpuTotal = cpuLoadPercent(prev: prev, cur: cur) }
             cpuTicksPrev = cur
         }
