@@ -1603,7 +1603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
                 self.availableVersion = v
-                if ud.string(forKey: Config.notifiedVersionKey) != v, !pauseActive(until: self.pausedUntil, now: Date()) {
+                if force || (ud.string(forKey: Config.notifiedVersionKey) != v && !pauseActive(until: self.pausedUntil, now: Date())) {
                     self.notifier.send("Guachiman \(v) disponible. Actualiza desde el menú.")
                     ud.set(v, forKey: Config.notifiedVersionKey)
                 }
@@ -2293,7 +2293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let acItem = NSMenuItem(title: "Auto-compact de Claude", action: nil, keyEquivalent: "")
         let acMenu = NSMenu()
         let acCurrent = readClaudeSettings().flatMap(autoCompactPct)
-        for pct in [nil, 50, 60, 70, 80] as [Int?] {
+        for pct in [nil, 15, 20, 30, 40, 50] as [Int?] {
             let it = NSMenuItem(title: pct.map { "\($0) %" } ?? "Por defecto de Claude", action: #selector(setAutoCompact(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = pct
@@ -2316,11 +2316,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: availableVersion.map { "Actualizar a \($0)" } ?? "Actualizar",
-                                    action: #selector(runUpdate), keyEquivalent: "")
+        let busy = updating || checkingUpdate
+        let updateTitle = updating ? "Actualizando…" : checkingUpdate ? "Comprobando…"
+            : availableVersion.map { "Actualizar a \($0)" } ?? "Buscar actualizaciones"
+        let updateItem = NSMenuItem(title: updateTitle,
+                                    action: availableVersion != nil ? #selector(runUpdate) : #selector(checkUpdateClicked), keyEquivalent: "")
         updateItem.target = self
-        updateItem.isEnabled = !updating
-        if availableVersion != nil {
+        updateItem.isEnabled = !busy
+        if availableVersion != nil && !busy {
             let dot = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: r).fill()
@@ -2329,9 +2332,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateItem.image = dot
         }
         menu.addItem(updateItem)
-        let checkItem = NSMenuItem(title: "Buscar actualizaciones", action: #selector(checkUpdateClicked), keyEquivalent: "")
-        checkItem.target = self
-        menu.addItem(checkItem)
         let uninstallItem = NSMenuItem(title: "Desinstalar", action: #selector(confirmUninstall), keyEquivalent: "")
         uninstallItem.target = self
         menu.addItem(uninstallItem)
