@@ -1542,7 +1542,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if launchAgentConflict(ownExists: FileManager.default.fileExists(atPath: agentURL.path), brewExists: brewAgentExists) {
             try? FileManager.default.removeItem(at: agentURL)
             if !UserDefaults.standard.bool(forKey: Config.dedupNotifiedKey) {
-                UserDefaults.standard.set(true, forKey: Config.dedupNotifiedKey)
                 dedupNote = "Guachiman ya arranca con Homebrew (brew services); se quitó el inicio duplicado"
             }
         }
@@ -1573,7 +1572,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
             if let note = updatedNote { self.notifier.send(note) }
-            if let note = dedupNote { self.notifier.send(note) }
+            if let note = dedupNote, self.notifier.isAuthorized {
+                self.notifier.send(note)
+                UserDefaults.standard.set(true, forKey: Config.dedupNotifiedKey)
+            }
             self.poll()
             self.checkForUpdate(force: false)
         }
@@ -1688,16 +1690,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Sesiones por CPU: > 80 % de un núcleo sostenido 120 s.
         sessionCpuTracker.retain(livePids)
         for s in snap.sessions {
+            // Una vez por episodio, como `appcpu:`: la clave queda hasta que la CPU baje del umbral.
+            let cpuKey = "sessioncpu:\(s.pid)"
             guard sessionCpuTracker.update(s.pid, over: s.cpu > Config.sessionCpuPercent, now: now) >= Config.sessionCpuSustained
-            else { continue }
+            else { lastAlert[cpuKey] = nil; continue }
             anyOver = true
+            guard lastAlert[cpuKey] == nil else { continue }
             let pct = Int(s.cpu.rounded())
-            if alert(key: "sessioncpu:\(s.pid)", value: s.cpu,
+            if alert(key: cpuKey, value: s.cpu,
                      text: "Sesión \(sessionLabel(s)) usa \(pct) % de CPU sostenido (pid \(s.pid))", now: now), aiEnabled {
                 startRelayIfNeeded()
                 appendAlert(sessionAlertLine(
                     ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
-                    limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: s.top,
+                    limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: nil,
                     cpu: pct, reason: "cpu"))
             }
         }

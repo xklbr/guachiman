@@ -113,7 +113,7 @@ Imprime una tabla con pid, etiqueta, MB totales, estado (verde, amarillo o rojo;
 Se calculan a partir de la RAM física (`hw.memsize`). Las constantes están al inicio de `guachiman.swift`.
 
 - Sesión: más del 15% de la RAM física, sostenido por al menos 60 s.
-- Sesión por CPU: más de 80% de un núcleo (suma de su árbol) sostenido por 120 s, con cooldown de 10 min por sesión; mantiene vivo el relay mientras siga en alerta.
+- Sesión por CPU: más de 80% de un núcleo (suma de su árbol) sostenido por 120 s, un aviso por episodio (otro solo si la CPU baja del umbral y vuelve a subir); mantiene vivo el relay mientras siga en alerta.
 - App: solo CPU, más de 80% de un núcleo sostenido por 120 s; se avisa una vez por episodio (otro aviso solo si la CPU baja del umbral y vuelve a subir). La RAM de las apps no avisa por separado: sale en el aviso de memoria libre baja.
 - Sistema: memoria libre menor a 20% (`kern.memorystatus_level`).
 - Enfriamiento de 10 min por alerta (sesiones, huérfanos y sistema); avisa antes solo si el valor creció más de 25% desde el último aviso.
