@@ -40,6 +40,8 @@ enum Config {
     static let relayIdleStop: TimeInterval = 300   // relay apagado tras 5 min seguidos sin alerta activa
     static let loginText = "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`"
     static let agentLabel = "io.github.guachiman"
+    static let brewAgentLabels = ["sh.brew.guachiman", "homebrew.mxcl.guachiman"]   // brew services
+    static let dedupNotifiedKey = "launchAgentDedupNotified"
     static let supportDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Guachiman").path
     static let alertsFile = supportDir + "/alerts.jsonl"
@@ -213,6 +215,9 @@ func launchAgentPlist(executable: String) -> [String: Any] {
      "KeepAlive": ["SuccessfulExit": false],
      "ProcessType": "Interactive"]
 }
+
+/// Dos LaunchAgents (el propio y el de brew services) lanzarían dos instancias al iniciar sesión.
+func launchAgentConflict(ownExists: Bool, brewExists: Bool) -> Bool { ownExists && brewExists }
 
 /// Hijo más grande (por RSS) de una sesión; el pid raíz nunca cuenta.
 struct TopChild: Equatable {
@@ -808,6 +813,9 @@ func runSelfTest() {
     let oo = (try? JSONSerialization.jsonObject(with: Data(ol.utf8))) as? [String: Any]
     precondition(oo?["kind"] as? String == "orphan" && oo?["name"] as? String == "node" && oo?["mb"] as? Int == 600
                  && oo?["limit_mb"] as? Int == 500 && oo?["cwd"] as? String == "/x" && oo?["ts"] as? Int == 3)
+    precondition(launchAgentConflict(ownExists: true, brewExists: true))
+    precondition(!launchAgentConflict(ownExists: true, brewExists: false) && !launchAgentConflict(ownExists: false, brewExists: true)
+                 && !launchAgentConflict(ownExists: false, brewExists: false))
     precondition(sanitizeName("a$(rm -rf)/b\n\"c\" é.x-1_+ ") == "arm -rfbc .x-1_+ ")
     precondition(sanitizeName(String(repeating: "a", count: 90)).count == 40)
     precondition(sanitizeText("a\nb\u{1B}[0m\tc") == "ab[0mc" && sanitizeText(String(repeating: "é", count: 300)).count == 200)
@@ -1471,8 +1479,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cpuTotal: Double?
     private var cpuTicksPrev: (busy: UInt64, total: UInt64)?
     private var debugPanelShown = false
+    private var dedupNote: String?
     private let agentURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/\(Config.agentLabel).plist")
+    private var brewAgentExists: Bool {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+        return Config.brewAgentLabels.contains { FileManager.default.fileExists(atPath: dir.appendingPathComponent("\($0).plist").path) }
+    }
     private var autoClose: Bool {
         get { UserDefaults.standard.bool(forKey: Config.autoCloseKey) }
         set { UserDefaults.standard.set(newValue, forKey: Config.autoCloseKey) }
@@ -1504,6 +1517,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Limpieza única del directorio `pending/` de versiones anteriores (inofensiva si no existe).
         try? FileManager.default.removeItem(atPath: Config.supportDir + "/pending")
         truncateAlerts()   // el relay es bajo demanda: al arrancar no hay ciclo anterior
+        if launchAgentConflict(ownExists: FileManager.default.fileExists(atPath: agentURL.path), brewExists: brewAgentExists) {
+            try? FileManager.default.removeItem(at: agentURL)
+            if !UserDefaults.standard.bool(forKey: Config.dedupNotifiedKey) {
+                UserDefaults.standard.set(true, forKey: Config.dedupNotifiedKey)
+                dedupNote = "Guachiman ya arranca con Homebrew (brew services); se quitó el inicio duplicado"
+            }
+        }
         if aiEnabled { _ = checkAILogin() }
         // SIGTERM (p. ej. `brew services stop`): detiene el relay antes de salir.
         signal(SIGTERM, SIG_IGN)
@@ -1531,6 +1551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
             if let note = updatedNote { self.notifier.send(note) }
+            if let note = dedupNote { self.notifier.send(note) }
             self.poll()
             self.checkForUpdate(force: false)
         }
@@ -1777,6 +1798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
+        guard !brewAgentExists else { return }
         if FileManager.default.fileExists(atPath: agentURL.path) {
             try? FileManager.default.removeItem(at: agentURL)
         } else if let exe = Bundle.main.executablePath {
@@ -2197,8 +2219,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         acItem.submenu = acMenu
         menu.addItem(acItem)
-        menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
-                            on: FileManager.default.fileExists(atPath: agentURL.path)))
+        if brewAgentExists {
+            let item = toggle("Iniciar al encender (gestionado por Homebrew)", #selector(toggleLaunchAtLogin), on: true)
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
+                                on: FileManager.default.fileExists(atPath: agentURL.path)))
+        }
         if !notifier.isAuthorized {
             let item = NSMenuItem(title: "Activar notificaciones", action: #selector(openNotificationSettings), keyEquivalent: "")
             item.target = self
