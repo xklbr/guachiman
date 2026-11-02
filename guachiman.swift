@@ -547,6 +547,13 @@ func sessionTitle(pid: pid_t) -> String? {
 /// Título ya conocido, sin leer disco.
 func cachedSessionTitle(pid: pid_t) -> String? { titleCache[pid]?.title }
 
+/// Solo desde main: descarta títulos, contexto y rutas de transcripción para releerlos al abrir el panel.
+func invalidateSessionCaches() {
+    titleCache = [:]
+    ctxCache = [:]
+    transcriptPathCache = [:]
+}
+
 func pruneTitleCache(live: Set<pid_t>) {
     titleCache = titleCache.filter { live.contains($0.key) }
     ctxCache = ctxCache.filter { live.contains($0.key) }
@@ -1391,7 +1398,7 @@ final class PanelRow: FlippedView {
 
     init(width: CGFloat, text: String, memory: String, cpu: String, color: NSColor, stopTag: Int?, stopLabel: String,
          stopTip: String, target: AnyObject, action: Selector, ctx: (text: String, color: NSColor)? = nil) {
-        let colW: CGFloat = 30, memW: CGFloat = 64
+        let colW: CGFloat = 42, memW: CGFloat = 74
         let colX = width - 8 - colW
         let memX = colX - 8 - memW
         cpuLabel = panelLabel(cpu, size: 11, mono: true, color: Pal.muted, align: .right,
@@ -1404,7 +1411,7 @@ final class PanelRow: FlippedView {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 3
         addSubview(dot)
-        let ctxW: CGFloat = ctx == nil ? 0 : 60
+        let ctxW: CGFloat = ctx == nil ? 0 : 66
         addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22 - ctxW, height: 16)))
         if let ctx {
             addSubview(panelLabel(ctx.text, size: 10.5, mono: true, color: ctx.color, align: .right,
@@ -1467,6 +1474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var orphanTracker = SustainedTracker<pid_t>()
     private var appCpuTracker = SustainedTracker<String>()
     private var polling = false
+    private var refreshing = false
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
     private var lastSnap: Snapshot?
@@ -1733,6 +1741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        refreshing = false
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
         schedule(Config.pollActive)
         checkForUpdate(force: false)
@@ -1757,6 +1766,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastAlert[key] = (now, value)
         notifier.send(text)
         return true
+    }
+
+    @objc private func refreshNow() {
+        guard !refreshing else { return }
+        refreshing = true
+        invalidateSessionCaches()
+        timer?.invalidate()
+        if let p = panel { fillPanel(p) }
+        poll()
     }
 
     @objc private func toggleAutoClose() { autoClose.toggle() }
@@ -1932,7 +1950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openPanel() {
         guard panel == nil, statusItem.button?.window != nil else { return }
-        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 170),
+        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 170),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -1993,7 +2011,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Reconstruye el contenido a partir del último snapshot y recoloca el panel bajo el ícono.
     private func fillPanel(_ p: IslandPanel) {
         let snap = lastSnap ?? Snapshot(sessions: [], orphans: [], apps: [], freePercent: 100)
-        let W: CGFloat = 300, pad: CGFloat = 6, iw = W - 2 * pad, rowH = PanelRow.height
+        let W: CGFloat = 360, pad: CGFloat = 6, iw = W - 2 * pad, rowH = PanelRow.height
         let limit = UInt64(Double(memory) * Config.sessionFraction)
         let sessions = Array(snap.sessions.prefix(8))
         let orphans = Array(snap.orphans.prefix(4))
@@ -2011,12 +2029,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var y = pad
 
         // Cabecera: dos medidores y los botones IA / ajustes.
-        let btnW: CGFloat = 22 * 2 + 2
+        let btnW: CGFloat = 22 * 3 + 4
         let meterW = (iw - 16 - btnW - 24) / 2
         func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ a11y: String) {
-            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 30, height: 14)))
+            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 40, height: 14)))
             root.addSubview(panelLabel(value, size: 12, weight: .semibold, mono: true, align: .right,
-                                       frame: NSRect(x: x + meterW - 30, y: y + 8, width: 30, height: 14)))
+                                       frame: NSRect(x: x + meterW - 40, y: y + 8, width: 40, height: 14)))
             let track = NSView(frame: NSRect(x: x, y: y + 8 + 14 + 5, width: meterW, height: 4))
             track.wantsLayer = true
             track.layer?.backgroundColor = Pal.accent.cgColor
@@ -2046,7 +2064,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let bx = pad + iw - 8 - btnW
         let by = y + 8 + (23 - 22) / 2
-        let ai = HoverButton(frame: NSRect(x: bx, y: by, width: 22, height: 22))
+        let refresh = HoverButton(frame: NSRect(x: bx, y: by, width: 22, height: 22))
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+        refresh.imagePosition = .imageOnly
+        refresh.isBordered = false
+        refresh.wantsLayer = true
+        refresh.layer?.cornerRadius = 5
+        refresh.contentTintColor = Pal.muted
+        refresh.isEnabled = !refreshing
+        refresh.toolTip = "Actualizar ahora"
+        refresh.setAccessibilityLabel("Actualizar ahora")
+        refresh.target = self
+        refresh.action = #selector(refreshNow)
+        root.addSubview(refresh)
+        let ai = HoverButton(frame: NSRect(x: bx + 24, y: by, width: 22, height: 22))
         let hasClaude = claudeBinary() != nil
         let aiColor: NSColor = !hasClaude || !aiEnabled ? Pal.muted.withAlphaComponent(0.5)
             : (aiLoginFailed ? .systemYellow : Pal.foreground)
@@ -2062,7 +2094,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ai.target = self
         ai.action = #selector(toggleAI(_:))
         root.addSubview(ai)
-        let gear = HoverButton(frame: NSRect(x: bx + 24, y: by, width: 22, height: 22))
+        let gear = HoverButton(frame: NSRect(x: bx + 48, y: by, width: 22, height: 22))
         gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
         gear.imagePosition = .imageOnly
@@ -2096,10 +2128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         func section(_ title: String, total: String? = nil) {
             root.addSubview(panelLabel(title, size: 11, weight: .semibold, color: Pal.muted,
-                                       frame: NSRect(x: pad + 8, y: y + 8, width: iw - 16 - 80, height: 14)))
+                                       frame: NSRect(x: pad + 8, y: y + 8, width: iw - 16 - 90, height: 14)))
             if let total {
                 root.addSubview(panelLabel(total, size: 11, mono: true, color: Pal.muted, align: .right,
-                                           frame: NSRect(x: pad + iw - 8 - 80, y: y + 8, width: 80, height: 14)))
+                                           frame: NSRect(x: pad + iw - 8 - 90, y: y + 8, width: 90, height: 14)))
             }
             y += 8 + 14 + 4 + 2
         }
@@ -2135,10 +2167,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     : (["critical", "exceeded", "danger", "error"].contains(u.severity) || u.percent >= 90 ? Pal.destructive : .systemYellow)
                 let reset = u.resetsAt.map { " · " + usageResetText($0, now: now) } ?? ""
                 root.addSubview(panelLabel(u.label, size: 12.5,
-                                           frame: NSRect(x: pad + 8, y: y + 3, width: iw - 16 - 110, height: 16)))
+                                           frame: NSRect(x: pad + 8, y: y + 3, width: iw - 16 - 130, height: 16)))
                 root.addSubview(panelLabel("\(u.percent)%\(reset)", size: 11, mono: true,
                                            color: u.severity == "normal" ? Pal.muted : tint, align: .right,
-                                           frame: NSRect(x: pad + iw - 8 - 110, y: y + 3, width: 110, height: 16)))
+                                           frame: NSRect(x: pad + iw - 8 - 130, y: y + 3, width: 130, height: 16)))
                 let track = NSView(frame: NSRect(x: pad + 8, y: y + 3 + 16 + 3, width: iw - 16, height: 4))
                 track.wantsLayer = true
                 track.layer?.backgroundColor = Pal.accent.cgColor

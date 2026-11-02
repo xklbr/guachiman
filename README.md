@@ -12,6 +12,7 @@ App nativa de la barra de menú de macOS (Swift + AppKit, macOS 13+) que vigila 
 - Muestra en el menú barras de RAM en uso y CPU con color de calor (verde → amarillo → rojo) y las sesiones ordenadas por consumo. Cada fila (sesiones, huérfanos y las 5 apps) lleva un círculo de color y un botón para detenerla (ver "Colores y detener").
 - Vigila todas las demás apps: agrupa los procesos por app (el `.app` más externo de la ruta del ejecutable, p. ej. los helpers de Google Chrome cuentan como "Google Chrome"; un proceso fuera de un `.app` es su propio grupo) y suma su RAM y su CPU (% de un núcleo, calculado entre dos sondeos). Los procesos de sesiones de Claude y de huérfanos no se repiten ahí. El menú lista las 5 apps que más RAM usan.
 - Te notifica cuando una sesión, una app (solo por CPU) o el sistema superan los umbrales; la RAM de las apps solo aparece en el aviso de memoria libre baja. Las apps solo se cierran si tú lo pides con el botón de detener.
+- El panel mide 360 pt de ancho. El botón **↻** de la cabecera ("Actualizar ahora") descarta las cachés de títulos y contexto, lanza un sondeo inmediato y redibuja el panel; queda deshabilitado mientras el sondeo corre. El sondeo lee los procesos fuera del hilo principal.
 - Lee los procesos con `libproc` y `sysctl`; no lanza `ps`.
 
 ## Notificaciones
