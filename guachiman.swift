@@ -20,6 +20,8 @@ enum Config {
     static let pollActive: TimeInterval = 20     // intervalo de sondeo
     static let appCpuPercent = 80.0              // alerta de app: > 80% de un núcleo
     static let appCpuSustained: TimeInterval = 120   // ... sostenido 120 s
+    static let sessionCpuPercent = 80.0          // alerta de sesión por CPU: > 80% de un núcleo
+    static let sessionCpuSustained: TimeInterval = 120   // ... sostenido 120 s
     static let sessionExecutable = "claude"
     static let orphanBytes: UInt64 = 500 * 1_048_576  // huérfano: > 500 MB
     static let orphanAlertAfter: TimeInterval = 60    // ... sostenido 60 s para avisar
@@ -40,6 +42,8 @@ enum Config {
     static let relayIdleStop: TimeInterval = 300   // relay apagado tras 5 min seguidos sin alerta activa
     static let loginText = "Inicia sesión en Claude Code: abre la terminal y ejecuta `claude`"
     static let agentLabel = "io.github.guachiman"
+    static let brewAgentLabels = ["sh.brew.guachiman", "homebrew.mxcl.guachiman"]   // brew services
+    static let dedupNotifiedKey = "launchAgentDedupNotified"
     static let supportDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Guachiman").path
     static let alertsFile = supportDir + "/alerts.jsonl"
@@ -214,6 +218,9 @@ func launchAgentPlist(executable: String) -> [String: Any] {
      "ProcessType": "Interactive"]
 }
 
+/// Dos LaunchAgents (el propio y el de brew services) lanzarían dos instancias al iniciar sesión.
+func launchAgentConflict(ownExists: Bool, brewExists: Bool) -> Bool { ownExists && brewExists }
+
 /// Hijo más grande (por RSS) de una sesión; el pid raíz nunca cuenta.
 struct TopChild: Equatable {
     var pid: pid_t
@@ -254,9 +261,11 @@ func sanitizeText(_ s: String) -> String {
 }
 
 /// Línea de `alerts.jsonl` para una sesión que superó el umbral.
-func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?) -> String {
+func sessionAlertLine(ts: Int, pid: pid_t, mb: UInt64, limitMB: UInt64, cwd: String, title: String?, top: TopChild?,
+                      cpu: Int? = nil, reason: String = "ram") -> String {
     var d: [String: Any] = ["kind": "session", "ts": ts, "pid": Int(pid), "mb": mb, "limit_mb": limitMB,
-                            "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull()]
+                            "cwd": sanitizeText(cwd), "title": title.map { sanitizeText($0) } ?? NSNull(), "reason": reason]
+    if let cpu { d["cpu"] = cpu }
     d["top"] = top.map { ["pid": Int($0.pid), "mb": $0.bytes / 1_048_576, "cmd": sanitizeName($0.cmd)] as [String: Any] } ?? NSNull()
     return jsonLine(d)
 }
@@ -542,6 +551,13 @@ func sessionTitle(pid: pid_t) -> String? {
 /// Título ya conocido, sin leer disco.
 func cachedSessionTitle(pid: pid_t) -> String? { titleCache[pid]?.title }
 
+/// Solo desde main: descarta títulos, contexto y rutas de transcripción para releerlos al abrir el panel.
+func invalidateSessionCaches() {
+    titleCache = [:]
+    ctxCache = [:]
+    transcriptPathCache = [:]
+}
+
 func pruneTitleCache(live: Set<pid_t>) {
     titleCache = titleCache.filter { live.contains($0.key) }
     ctxCache = ctxCache.filter { live.contains($0.key) }
@@ -804,10 +820,18 @@ func runSelfTest() {
     precondition(tj?["pid"] as? Int == 9 && tj?["mb"] as? Int == 3 && tj?["cmd"] as? String == "vitest")
     let l2 = (try? JSONSerialization.jsonObject(with: Data(sessionAlertLine(ts: 1, pid: 1, mb: 1, limitMB: 1, cwd: "", title: nil, top: nil).utf8))) as? [String: Any]
     precondition(l2?["top"] is NSNull && l2?["title"] is NSNull)
+    precondition(obj?["reason"] as? String == "ram" && obj?["cpu"] == nil)
+    let cl = sessionAlertLine(ts: 8, pid: 3, mb: 100, limitMB: 1024, cwd: "/x", title: nil, top: nil, cpu: 150, reason: "cpu")
+    let co = (try? JSONSerialization.jsonObject(with: Data(cl.utf8))) as? [String: Any]
+    precondition(co?["reason"] as? String == "cpu" && co?["cpu"] as? Int == 150 && co?["kind"] as? String == "session"
+                 && co?["pid"] as? Int == 3 && co?["ts"] as? Int == 8)
     let ol = orphanAlertLine(ts: 3, pid: 4, name: "node", mb: 600, limitMB: 500, cwd: "/x")
     let oo = (try? JSONSerialization.jsonObject(with: Data(ol.utf8))) as? [String: Any]
     precondition(oo?["kind"] as? String == "orphan" && oo?["name"] as? String == "node" && oo?["mb"] as? Int == 600
                  && oo?["limit_mb"] as? Int == 500 && oo?["cwd"] as? String == "/x" && oo?["ts"] as? Int == 3)
+    precondition(launchAgentConflict(ownExists: true, brewExists: true))
+    precondition(!launchAgentConflict(ownExists: true, brewExists: false) && !launchAgentConflict(ownExists: false, brewExists: true)
+                 && !launchAgentConflict(ownExists: false, brewExists: false))
     precondition(sanitizeName("a$(rm -rf)/b\n\"c\" é.x-1_+ ") == "arm -rfbc .x-1_+ ")
     precondition(sanitizeName(String(repeating: "a", count: 90)).count == 40)
     precondition(sanitizeText("a\nb\u{1B}[0m\tc") == "ab[0mc" && sanitizeText(String(repeating: "é", count: 300)).count == 200)
@@ -1095,8 +1119,11 @@ func currentDirectory(_ pid: pid_t) -> String? {
 }
 
 private let sessionLimitBytes = UInt64(Double(physicalMemory()) * Config.sessionFraction)
+private let snapshotLock = NSLock()   // cpuPrev/cpuPrevAt: el sondeo corre fuera de main y otros cierres llaman desde main
 
 func takeSnapshot() -> Snapshot {
+    snapshotLock.lock()
+    defer { snapshotLock.unlock() }
     var parents: [pid_t: pid_t] = [:]
     var children: [pid_t: [pid_t]] = [:]
     var claudePids = Set<pid_t>()
@@ -1380,7 +1407,7 @@ final class PanelRow: FlippedView {
 
     init(width: CGFloat, text: String, memory: String, cpu: String, color: NSColor, stopTag: Int?, stopLabel: String,
          stopTip: String, target: AnyObject, action: Selector, ctx: (text: String, color: NSColor)? = nil) {
-        let colW: CGFloat = 30, memW: CGFloat = 64
+        let colW: CGFloat = 42, memW: CGFloat = 74
         let colX = width - 8 - colW
         let memX = colX - 8 - memW
         cpuLabel = panelLabel(cpu, size: 11, mono: true, color: Pal.muted, align: .right,
@@ -1393,7 +1420,7 @@ final class PanelRow: FlippedView {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.cornerRadius = 3
         addSubview(dot)
-        let ctxW: CGFloat = ctx == nil ? 0 : 60
+        let ctxW: CGFloat = ctx == nil ? 0 : 66
         addSubview(panelLabel(text, size: 12.5, frame: NSRect(x: 22, y: 4, width: memX - 8 - 22 - ctxW, height: 16)))
         if let ctx {
             addSubview(panelLabel(ctx.text, size: 10.5, mono: true, color: ctx.color, align: .right,
@@ -1455,6 +1482,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overSince: [pid_t: Date] = [:]
     private var orphanTracker = SustainedTracker<pid_t>()
     private var appCpuTracker = SustainedTracker<String>()
+    private var sessionCpuTracker = SustainedTracker<pid_t>()
+    private var polling = false
+    private var refreshing = false
     private var closedAttempted = Set<pid_t>()
     private var pausedUntil: Date?
     private var lastSnap: Snapshot?
@@ -1471,8 +1501,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cpuTotal: Double?
     private var cpuTicksPrev: (busy: UInt64, total: UInt64)?
     private var debugPanelShown = false
+    private var dedupNote: String?
     private let agentURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents/\(Config.agentLabel).plist")
+    private var brewAgentExists: Bool {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
+        return Config.brewAgentLabels.contains { FileManager.default.fileExists(atPath: dir.appendingPathComponent("\($0).plist").path) }
+    }
     private var autoClose: Bool {
         get { UserDefaults.standard.bool(forKey: Config.autoCloseKey) }
         set { UserDefaults.standard.set(newValue, forKey: Config.autoCloseKey) }
@@ -1504,6 +1539,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Limpieza única del directorio `pending/` de versiones anteriores (inofensiva si no existe).
         try? FileManager.default.removeItem(atPath: Config.supportDir + "/pending")
         truncateAlerts()   // el relay es bajo demanda: al arrancar no hay ciclo anterior
+        if launchAgentConflict(ownExists: FileManager.default.fileExists(atPath: agentURL.path), brewExists: brewAgentExists) {
+            try? FileManager.default.removeItem(at: agentURL)
+            if !UserDefaults.standard.bool(forKey: Config.dedupNotifiedKey) {
+                dedupNote = "Guachiman ya arranca con Homebrew (brew services); se quitó el inicio duplicado"
+            }
+        }
         if aiEnabled { _ = checkAILogin() }
         // SIGTERM (p. ej. `brew services stop`): detiene el relay antes de salir.
         signal(SIGTERM, SIG_IGN)
@@ -1531,6 +1572,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if wantsTest { self.notifier.send("Prueba: Guachiman puede notificarte") }
             if let note = updatedNote { self.notifier.send(note) }
+            if let note = dedupNote, self.notifier.isAuthorized {
+                self.notifier.send(note)
+                UserDefaults.standard.set(true, forKey: Config.dedupNotifiedKey)
+            }
             self.poll()
             self.checkForUpdate(force: false)
         }
@@ -1558,7 +1603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
                 self.availableVersion = v
-                if ud.string(forKey: Config.notifiedVersionKey) != v, !pauseActive(until: self.pausedUntil, now: Date()) {
+                if force || (ud.string(forKey: Config.notifiedVersionKey) != v && !pauseActive(until: self.pausedUntil, now: Date())) {
                     self.notifier.send("Guachiman \(v) disponible. Actualiza desde el menú.")
                     ud.set(v, forKey: Config.notifiedVersionKey)
                 }
@@ -1584,10 +1629,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notifier.refresh { [weak self] in self?.runPoll() }
     }
 
+    /// La lectura de procesos va en una cola utilitaria; todo lo demás (trackers, alertas, UI) vuelve a main.
     private func runPoll() {
-        let snap = takeSnapshot()
+        guard !polling else { return }
+        polling = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let snap = takeSnapshot()
+            let ticks = cpuTicks()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.polling = false
+                self.applyPoll(snap, ticks: ticks)
+            }
+        }
+    }
+
+    private func applyPoll(_ snap: Snapshot, ticks: (busy: UInt64, total: UInt64)?) {
         let now = Date()
-        if let cur = cpuTicks() {
+        if let cur = ticks {
             if let prev = cpuTicksPrev { cpuTotal = cpuLoadPercent(prev: prev, cur: cur) }
             cpuTicksPrev = cur
         }
@@ -1625,6 +1684,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } else {
                 overSince[s.pid] = nil
+            }
+        }
+
+        // Sesiones por CPU: > 80 % de un núcleo sostenido 120 s.
+        sessionCpuTracker.retain(livePids)
+        for s in snap.sessions {
+            // Una vez por episodio, como `appcpu:`: la clave queda hasta que la CPU baje del umbral.
+            let cpuKey = "sessioncpu:\(s.pid)"
+            guard sessionCpuTracker.update(s.pid, over: s.cpu > Config.sessionCpuPercent, now: now) >= Config.sessionCpuSustained
+            else { lastAlert[cpuKey] = nil; continue }
+            anyOver = true
+            guard lastAlert[cpuKey] == nil else { continue }
+            let pct = Int(s.cpu.rounded())
+            if alert(key: cpuKey, value: s.cpu,
+                     text: "Sesión \(sessionLabel(s)) usa \(pct) % de CPU sostenido (pid \(s.pid))", now: now), aiEnabled {
+                startRelayIfNeeded()
+                appendAlert(sessionAlertLine(
+                    ts: Int(now.timeIntervalSince1970), pid: s.pid, mb: s.bytes / 1_048_576,
+                    limitMB: limit / 1_048_576, cwd: s.cwd, title: cachedSessionTitle(pid: s.pid), top: nil,
+                    cpu: pct, reason: "cpu"))
             }
         }
 
@@ -1676,6 +1755,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pruneTitleCache(live: livePids)
         lastAlert = lastAlert.filter { k, _ in
             if k.hasPrefix("session:") { return livePids.contains(pid_t(k.dropFirst(8)) ?? -1) }
+            if k.hasPrefix("sessioncpu:") { return livePids.contains(pid_t(k.dropFirst(11)) ?? -1) }
             if k.hasPrefix("orphan:") { return orphanPids.contains(pid_t(k.dropFirst(7)) ?? -1) }
             if k.hasPrefix("appcpu:") { return appKeys.contains(String(k.dropFirst(7))) }
             return true
@@ -1694,6 +1774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        refreshing = false
         updateUI(snap, alerting: anyOver || systemLow || orphanOver || appOver)
         schedule(Config.pollActive)
         checkForUpdate(force: false)
@@ -1718,6 +1799,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastAlert[key] = (now, value)
         notifier.send(text)
         return true
+    }
+
+    @objc private func refreshNow() {
+        guard !refreshing else { return }
+        refreshing = true
+        invalidateSessionCaches()
+        timer?.invalidate()
+        if let p = panel { fillPanel(p) }
+        poll()
     }
 
     @objc private func toggleAutoClose() { autoClose.toggle() }
@@ -1777,6 +1867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
+        guard !brewAgentExists else { return }
         if FileManager.default.fileExists(atPath: agentURL.path) {
             try? FileManager.default.removeItem(at: agentURL)
         } else if let exe = Bundle.main.executablePath {
@@ -1892,7 +1983,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openPanel() {
         guard panel == nil, statusItem.button?.window != nil else { return }
-        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 170),
+        let p = IslandPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 170),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -1953,7 +2044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Reconstruye el contenido a partir del último snapshot y recoloca el panel bajo el ícono.
     private func fillPanel(_ p: IslandPanel) {
         let snap = lastSnap ?? Snapshot(sessions: [], orphans: [], apps: [], freePercent: 100)
-        let W: CGFloat = 300, pad: CGFloat = 6, iw = W - 2 * pad, rowH = PanelRow.height
+        let W: CGFloat = 360, pad: CGFloat = 6, iw = W - 2 * pad, rowH = PanelRow.height
         let limit = UInt64(Double(memory) * Config.sessionFraction)
         let sessions = Array(snap.sessions.prefix(8))
         let orphans = Array(snap.orphans.prefix(4))
@@ -1971,12 +2062,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var y = pad
 
         // Cabecera: dos medidores y los botones IA / ajustes.
-        let btnW: CGFloat = 22 * 2 + 2
+        let btnW: CGFloat = 22 * 3 + 4
         let meterW = (iw - 16 - btnW - 24) / 2
         func meter(_ x: CGFloat, _ label: String, _ value: String, _ fraction: Double, _ a11y: String) {
-            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 30, height: 14)))
+            root.addSubview(panelLabel(label, size: 11, color: Pal.muted, frame: NSRect(x: x, y: y + 8, width: meterW - 40, height: 14)))
             root.addSubview(panelLabel(value, size: 12, weight: .semibold, mono: true, align: .right,
-                                       frame: NSRect(x: x + meterW - 30, y: y + 8, width: 30, height: 14)))
+                                       frame: NSRect(x: x + meterW - 40, y: y + 8, width: 40, height: 14)))
             let track = NSView(frame: NSRect(x: x, y: y + 8 + 14 + 5, width: meterW, height: 4))
             track.wantsLayer = true
             track.layer?.backgroundColor = Pal.accent.cgColor
@@ -2006,7 +2097,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let bx = pad + iw - 8 - btnW
         let by = y + 8 + (23 - 22) / 2
-        let ai = HoverButton(frame: NSRect(x: bx, y: by, width: 22, height: 22))
+        let refresh = HoverButton(frame: NSRect(x: bx, y: by, width: 22, height: 22))
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+        refresh.imagePosition = .imageOnly
+        refresh.isBordered = false
+        refresh.wantsLayer = true
+        refresh.layer?.cornerRadius = 5
+        refresh.contentTintColor = Pal.muted
+        refresh.isEnabled = !refreshing
+        refresh.toolTip = "Actualizar ahora"
+        refresh.setAccessibilityLabel("Actualizar ahora")
+        refresh.target = self
+        refresh.action = #selector(refreshNow)
+        root.addSubview(refresh)
+        let ai = HoverButton(frame: NSRect(x: bx + 24, y: by, width: 22, height: 22))
         let hasClaude = claudeBinary() != nil
         let aiColor: NSColor = !hasClaude || !aiEnabled ? Pal.muted.withAlphaComponent(0.5)
             : (aiLoginFailed ? .systemYellow : Pal.foreground)
@@ -2022,7 +2127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ai.target = self
         ai.action = #selector(toggleAI(_:))
         root.addSubview(ai)
-        let gear = HoverButton(frame: NSRect(x: bx + 24, y: by, width: 22, height: 22))
+        let gear = HoverButton(frame: NSRect(x: bx + 48, y: by, width: 22, height: 22))
         gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
         gear.imagePosition = .imageOnly
@@ -2056,10 +2161,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         func section(_ title: String, total: String? = nil) {
             root.addSubview(panelLabel(title, size: 11, weight: .semibold, color: Pal.muted,
-                                       frame: NSRect(x: pad + 8, y: y + 8, width: iw - 16 - 80, height: 14)))
+                                       frame: NSRect(x: pad + 8, y: y + 8, width: iw - 16 - 90, height: 14)))
             if let total {
                 root.addSubview(panelLabel(total, size: 11, mono: true, color: Pal.muted, align: .right,
-                                           frame: NSRect(x: pad + iw - 8 - 80, y: y + 8, width: 80, height: 14)))
+                                           frame: NSRect(x: pad + iw - 8 - 90, y: y + 8, width: 90, height: 14)))
             }
             y += 8 + 14 + 4 + 2
         }
@@ -2095,10 +2200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     : (["critical", "exceeded", "danger", "error"].contains(u.severity) || u.percent >= 90 ? Pal.destructive : .systemYellow)
                 let reset = u.resetsAt.map { " · " + usageResetText($0, now: now) } ?? ""
                 root.addSubview(panelLabel(u.label, size: 12.5,
-                                           frame: NSRect(x: pad + 8, y: y + 3, width: iw - 16 - 110, height: 16)))
+                                           frame: NSRect(x: pad + 8, y: y + 3, width: iw - 16 - 130, height: 16)))
                 root.addSubview(panelLabel("\(u.percent)%\(reset)", size: 11, mono: true,
                                            color: u.severity == "normal" ? Pal.muted : tint, align: .right,
-                                           frame: NSRect(x: pad + iw - 8 - 110, y: y + 3, width: 110, height: 16)))
+                                           frame: NSRect(x: pad + iw - 8 - 130, y: y + 3, width: 130, height: 16)))
                 let track = NSView(frame: NSRect(x: pad + 8, y: y + 3 + 16 + 3, width: iw - 16, height: 4))
                 track.wantsLayer = true
                 track.layer?.backgroundColor = Pal.accent.cgColor
@@ -2188,7 +2293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let acItem = NSMenuItem(title: "Auto-compact de Claude", action: nil, keyEquivalent: "")
         let acMenu = NSMenu()
         let acCurrent = readClaudeSettings().flatMap(autoCompactPct)
-        for pct in [nil, 50, 60, 70, 80] as [Int?] {
+        for pct in [nil, 15, 20, 30, 40, 50] as [Int?] {
             let it = NSMenuItem(title: pct.map { "\($0) %" } ?? "Por defecto de Claude", action: #selector(setAutoCompact(_:)), keyEquivalent: "")
             it.target = self
             it.representedObject = pct
@@ -2197,19 +2302,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         acItem.submenu = acMenu
         menu.addItem(acItem)
-        menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
-                            on: FileManager.default.fileExists(atPath: agentURL.path)))
+        if brewAgentExists {
+            let item = toggle("Iniciar al encender (gestionado por Homebrew)", #selector(toggleLaunchAtLogin), on: true)
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            menu.addItem(toggle("Iniciar al encender", #selector(toggleLaunchAtLogin),
+                                on: FileManager.default.fileExists(atPath: agentURL.path)))
+        }
         if !notifier.isAuthorized {
             let item = NSMenuItem(title: "Activar notificaciones", action: #selector(openNotificationSettings), keyEquivalent: "")
             item.target = self
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let updateItem = NSMenuItem(title: availableVersion.map { "Actualizar a \($0)" } ?? "Actualizar",
-                                    action: #selector(runUpdate), keyEquivalent: "")
+        let busy = updating || checkingUpdate
+        let updateTitle = updating ? "Actualizando…" : checkingUpdate ? "Comprobando…"
+            : availableVersion.map { "Actualizar a \($0)" } ?? "Buscar actualizaciones"
+        let updateItem = NSMenuItem(title: updateTitle,
+                                    action: availableVersion != nil ? #selector(runUpdate) : #selector(checkUpdateClicked), keyEquivalent: "")
         updateItem.target = self
-        updateItem.isEnabled = !updating
-        if availableVersion != nil {
+        updateItem.isEnabled = !busy
+        if availableVersion != nil && !busy {
             let dot = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: r).fill()
@@ -2218,9 +2332,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateItem.image = dot
         }
         menu.addItem(updateItem)
-        let checkItem = NSMenuItem(title: "Buscar actualizaciones", action: #selector(checkUpdateClicked), keyEquivalent: "")
-        checkItem.target = self
-        menu.addItem(checkItem)
         let uninstallItem = NSMenuItem(title: "Desinstalar", action: #selector(confirmUninstall), keyEquivalent: "")
         uninstallItem.target = self
         menu.addItem(uninstallItem)

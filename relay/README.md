@@ -5,7 +5,7 @@ Una sesión de Claude Code en segundo plano (Haiku) que lee las alertas de memor
 ## Qué hace
 
 - Vigila `~/Library/Application Support/Guachiman/alerts.jsonl` con `tail -n 0 -F` (Monitor persistente, se re-arma al expirar).
-- Alerta de sesión: envía UN mensaje corto `[Guachiman]` a la sesión (nombre tomado de `~/.claude/sessions/<pid>.json`) con el total vs el límite, el proceso hijo más pesado y qué hacer. No comprueba si el pid sigue vivo: Guachiman solo escribe la alerta mientras el proceso está vivo y sobre el umbral.
+- Alerta de sesión (RAM o, con `reason:"cpu"`, CPU sostenida): envía UN mensaje corto `[Guachiman]` a la sesión (nombre tomado de `~/.claude/sessions/<pid>.json`) con el total vs el límite, el proceso hijo más pesado y qué hacer. No comprueba si el pid sigue vivo: Guachiman solo escribe la alerta mientras el proceso está vivo y sobre el umbral.
 - Alerta de huérfano: busca con `Read` sobre `~/.claude/sessions/*.json` (o `ListAgents`) las sesiones vivas cuyo `cwd` sea igual o prefijo del `cwd` del huérfano y les avisa. Si no hay ninguna, no hace nada (Guachiman ya avisó al usuario).
 - Seguimiento: si llega otra alerta del mismo pid después de haber avisado a su sesión una vez, insiste UNA vez (un mensaje). Después ignora ese pid.
 
