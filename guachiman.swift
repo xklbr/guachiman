@@ -297,6 +297,17 @@ func claudeBinary() -> String? {
         .first { FileManager.default.isExecutableFile(atPath: $0) }
 }
 
+/// Interpreta la salida de `launchctl list` (PID, Status, Label): pid → label de los servicios en ejecución.
+/// Salta la cabecera y las filas con PID "-" (no están corriendo).
+func parseLaunchctlList(_ text: String) -> [pid_t: String] {
+    var map: [pid_t: String] = [:]
+    for line in text.split(separator: "\n") {
+        let cols = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+        if cols.count == 3, let pid = pid_t(cols[0]) { map[pid] = String(cols[2]) }
+    }
+    return map
+}
+
 /// Interpreta la salida de `claude auth status --json`: true solo si `loggedIn` es true.
 func parseAuthLoggedIn(_ data: Data) -> Bool {
     ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["loggedIn"] as? Bool ?? false
@@ -766,6 +777,8 @@ func sessionContext(pid: pid_t) -> ContextInfo? {
 }
 
 func runSelfTest() {
+    let lc = "PID\tStatus\tLabel\n123\t0\tcom.example.agent\n-\t0\tcom.example.idle\n"
+    precondition(parseLaunchctlList(lc) == [123: "com.example.agent"])   // fila con pid mapea; "-" y cabecera se ignoran
     precondition(parseAuthLoggedIn(Data(#"{"loggedIn":true,"authMethod":"claude.ai"}"#.utf8)))
     precondition(!parseAuthLoggedIn(Data(#"{"loggedIn":false}"#.utf8)))
     precondition(!parseAuthLoggedIn(Data("basura".utf8)))
@@ -1323,7 +1336,8 @@ struct KillTarget {
 
 /// ¿Es seguro enviarle señales? Nunca pid <= 1 ni Guachiman.
 func signalable(_ pid: pid_t) -> Bool { pid > 1 && pid != getpid() }
-func alive(_ pid: pid_t) -> Bool { signalable(pid) && kill(pid, 0) == 0 }
+/// EPERM significa que el proceso existe pero es de otro usuario/root: sigue vivo.
+func alive(_ pid: pid_t) -> Bool { signalable(pid) && (kill(pid, 0) == 0 || errno == EPERM) }
 
 /// Descendientes de `root` (incluido), en preorden, con una lectura nueva de la tabla de procesos.
 func liveTree(_ root: pid_t) -> [pid_t] {
@@ -2437,20 +2451,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminate(t)
     }
 
+    /// Descarga de launchd (bootout) los servicios dueños de estos pids para que KeepAlive no los reviva.
+    private func bootoutLaunchdJobs(_ pids: [pid_t]) {
+        func launchctl(_ args: [String]) -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = args
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return "" }
+            let out = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return String(decoding: out, as: UTF8.self)
+        }
+        let labels = parseLaunchctlList(launchctl(["list"]))
+        // "application.*" son apps normales: se cierran con terminate() para no saltarse el "¿guardar cambios?".
+        for label in Set(pids.compactMap { labels[$0] }) where !label.hasPrefix("application.") {
+            _ = launchctl(["bootout", "gui/\(getuid())/\(label)"])
+        }
+    }
+
     private func terminate(_ t: KillTarget) {
         var apps: [NSRunningApplication] = []
         if let path = t.appPath {
             let want = path.hasSuffix("/") ? String(path.dropLast()) : path
             apps = NSWorkspace.shared.runningApplications.filter { $0.bundleURL?.path == want }
         }
-        let targets: [pid_t]   // en el orden en que se señalan (hijos primero)
+        var targets: [pid_t]   // en el orden en que se señalan (hijos primero)
+        var denied: [pid_t] = []   // kill() falló con EPERM: son de otro usuario/root
         if !apps.isEmpty {
+            bootoutLaunchdJobs(apps.map { $0.processIdentifier })
             apps.forEach { $0.terminate() }
             targets = apps.map { $0.processIdentifier }
         } else {
             let tree = t.expandTree ? t.pids.flatMap { liveTree($0) } : t.pids
             targets = t.appPath == nil ? tree.reversed() : tree
-            for pid in targets where alive(pid) { kill(pid, SIGTERM) }
+            bootoutLaunchdJobs(targets)
+            for pid in targets where alive(pid) {
+                if kill(pid, SIGTERM) == -1 && errno == EPERM { denied.append(pid) }
+            }
+            targets.removeAll { denied.contains($0) }
+        }
+        if !denied.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "\(t.name) pertenece a otro usuario o a root"
+            alert.informativeText = "No tienes permiso para cerrarlo. Ejecútalo en la Terminal:\n\nsudo kill " + denied.map(String.init).joined(separator: " ")
+            alert.addButton(withTitle: "Entendido")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
         }
         let closing = apps
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
